@@ -1,12 +1,12 @@
 # Repo Guard
 
-Stop secrets, private hostnames, local paths, and personal emails from ever entering your Git history.
+Block secrets, private hostnames, local paths, and personal emails from entering your Git history.
 
 Repo Guard runs as global Git hooks (`pre-commit`, `commit-msg`, `pre-push`) and as a strict pre-publish repository auditor. It runs on plain Python 3 with zero third-party packages and keeps your private pattern list outside Git.
 
 ## Installation
 
-Requires Python 3.11+ and Git.
+Requires Python 3.11+ and Git. Ensure `$HOME/.local/bin` is on your `PATH`.
 
 ```bash
 chmod +x bin/repo-guard
@@ -23,7 +23,9 @@ repo-guard init-local \
   --add-identity "janedoe.example"
 ```
 
-Enable global Git hooks so every repository on your machine is protected automatically:
+Expected output: `repo-guard initialized local private config at ~/.config/repo-guard/private-patterns.json (mode 0600)`.
+
+Enable global Git hooks so every repository on your machine is checked before commit and push:
 
 ```bash
 git config --global core.hooksPath "$HOME/.config/git/hooks"
@@ -35,7 +37,7 @@ Audit any repository before open-sourcing or pushing publicly:
 repo-guard audit-repo --strict /path/to/your-repo
 ```
 
-Every finding reports the exact `file:line`, rule ID, redacted snippet, and a concrete 12-Factor fix.
+Clean repositories print `repo-guard PASS [audit-repo --strict]: 0 findings` and exit `0`. Any match exits `1` with the exact `file:line`, rule ID, redacted snippet, and fix suggestion.
 
 ## Commands
 
@@ -61,7 +63,7 @@ Every finding reports the exact `file:line`, rule ID, redacted snippet, and a co
 
 ## Per-Repository Policy
 
-Add an optional `.repo-guard.json` to allow known non-secret terms or fixture paths:
+Override the private pattern file path with `REPO_GUARD_CONFIG` (see [`.env.example`](.env.example)). Add an optional `.repo-guard.json` to allow known non-secret terms or fixture paths:
 
 ```json
 {
