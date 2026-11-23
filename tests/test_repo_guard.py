@@ -291,6 +291,62 @@ class TestScannerUnit(unittest.TestCase):
         hits = scan_commit_message(scanner, msg_leak)
         self.assertTrue(any(h.rule_id == "RG-ID-001" for h in hits))
 
+    def test_ui_emoji_guard_blocks_literal_and_encoded_emojis_with_zero_false_positives(self) -> None:
+        scanner = RepoScanner(_make_config())
+
+        # Dynamically build emoji fixtures so test file contains zero literal emojis.
+        rocket = chr(0x1F680)
+        bolt = chr(0x26A1)
+        warn_vs16 = chr(0x26A0) + chr(0xFE0F)
+        wrench_smp = chr(0x1F6E0)
+        keycap = "1" + chr(0xFE0F) + chr(0x20E3)
+        flag_us = chr(0x1F1FA) + chr(0x1F1F8)
+        zwj_family = chr(0x1F469) + chr(0x200D) + chr(0x1F4BB)
+
+        blocked_cases = [
+            ("public/index.html", f"<button>{rocket} Deploy</button>"),
+            ("src/App.tsx", f"const badge = '{bolt} Fast';"),
+            ("src/Banner.vue", f"<p>{warn_vs16} Disk almost full</p>"),
+            ("src/Toolbar.svelte", f"<span>{wrench_smp} Tools</span>"),
+            ("ui/Main.qml", f'text: "{keycap} First step"'),
+            ("public/header.html", f"<span>{flag_us} EN</span>"),
+            ("public/app.js", f'el.textContent = "{zwj_family} Engineer";'),
+            ("public/index.html", "<span>&#x1F680; Launch</span>"),
+            ("public/index.html", "<span>&#128640; Launch</span>"),
+            ("public/index.html", "<span>&#x26A0;&#xFE0F; Caution</span>"),
+            ("src/ui.ts", r'const label = "\u{1F4AC} Reply";'),
+            ("src/ui.js", r'const icon = "\uD83D\uDE80";'),
+            ("src/ui.ts", r'const warn = "\u26A0\uFE0F";'),
+            ("public/styles.css", r'.cta::before { content: "\1F680"; }'),
+            ("public/styles.scss", r'.pill::after { content: "\01F4AC "; }'),
+        ]
+        for rel_path, line in blocked_cases:
+            hits = scanner.scan_line(rel_path, 1, line)
+            self.assertTrue(
+                any(h.rule_id == "RG-UI-001" for h in hits),
+                f"Expected RG-UI-001 for {rel_path}: {line!r}",
+            )
+
+        # Clean monochrome symbols, SVG icons, tests, regex ranges, and non-UI docs must NOT trigger RG-UI-001.
+        allowed_cases = [
+            ("public/index.html", "<button>&#x2713; Save &copy; 2026 &rarr;</button>"),
+            ("src/App.tsx", 'const glyphs = "✓ ✗ ✕ ✎ ✦ ▸ ▶ ○ ● ★ → ↗ ↩ ⌘ © ® ™ — …";'),
+            ("public/styles.css", '.item::before { content: "\\2022 "; }'),
+            ("src/validator.ts", r"const rangeRe = /[\u{1F000}-\u{1FAFF}]/u;"),
+            ("tests/app.test.tsx", f'expect(strip("{rocket} ok")).toBe("ok");'),
+            ("src/__tests__/ui.spec.ts", f'const fixture = "{bolt}";'),
+            ("tests/fixtures/emoji.html", f"<p>{rocket}</p>"),
+            ("README.md", f"# Demo {rocket}"),
+            ("scripts/cli.py", f'print("{rocket} done")'),
+        ]
+        for rel_path, line in allowed_cases:
+            hits = scanner.scan_line(rel_path, 1, line)
+            self.assertEqual(
+                [h for h in hits if h.rule_id == "RG-UI-001"],
+                [],
+                f"Unexpected RG-UI-001 for {rel_path}: {line!r} -> {hits}",
+            )
+
 
 class TestGitHooksIntegration(unittest.TestCase):
     """End-to-end tests running real git pre-commit, commit-msg, and pre-push hooks."""
@@ -452,6 +508,23 @@ class TestGitHooksIntegration(unittest.TestCase):
         self.assertIn("RG-FILE-001", res.stderr)
         self._git(["reset", "HEAD", ".env"], check=True)
         (self.repo_dir / ".env").unlink()
+
+        # 6b. User-facing UI emoji blocked by pre-commit; clean monochrome SVG UI allowed.
+        rocket = chr(0x1F680)
+        (self.repo_dir / "index.html").write_text(f"<button>{rocket} Launch</button>\n", encoding="utf-8")
+        self._git(["add", "index.html"], check=True)
+        res = self._git(["commit", "-m", "feat: add launch button"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("RG-UI-001", res.stderr)
+        self._git(["reset", "HEAD", "index.html"], check=True)
+
+        (self.repo_dir / "index.html").write_text(
+            '<button><svg aria-hidden="true" viewBox="0 0 16 16"></svg> Launch</button>\n',
+            encoding="utf-8",
+        )
+        self._git(["add", "index.html"], check=True)
+        res_ui_ok = self._git(["commit", "-m", "feat: add clean svg launch button"])
+        self.assertEqual(res_ui_ok.returncode, 0, f"Clean UI commit failed: {res_ui_ok.stderr}")
 
         # 7. Clean push succeeds to bare remote.
         res_push_ok = self._git(["push", "-u", "origin", "main"])

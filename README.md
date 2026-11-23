@@ -60,6 +60,7 @@ Clean repositories print `repo-guard PASS [audit-repo --strict]: 0 findings` and
 | `RG-NET-004` | No | Hardcoded non-loopback `http(s)://<private-host>:<port>` URLs |
 | `RG-ID-001` | Yes | Configured personal names, handles, emails, and private domains |
 | `RG-HOST-001..003` | No | Configured private infrastructure hostnames |
+| `RG-UI-001` | No | Literal or encoded Unicode emojis in user-facing UI files (`.html`, `.jsx`, `.tsx`, `.vue`, `.svelte`, `.css`, `.qml`, `.svg`, frontend `.js`/`.ts`) |
 
 ## Per-Repository Policy
 

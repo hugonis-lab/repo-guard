@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
 from .config import HARD_CEILING_CATEGORIES, GuardConfig
+from .emoji import find_ui_emojis, is_ui_source_path
 
 # Binary extensions skipped for content scanning (filenames are still checked via RG-FILE-001).
 BINARY_EXTENSIONS: frozenset[str] = frozenset(
@@ -362,6 +363,8 @@ def _redact_snippet(
     token = line[start:end]
     if category == "secret":
         replacement = f"<{rule_id}:REDACTED>"
+    elif category == "ui_emoji":
+        replacement = f"<{rule_id}:{token}>"
     elif len(token) <= 6:
         replacement = f"<{rule_id}:REDACTED>"
     else:
@@ -902,6 +905,19 @@ class RepoScanner:
                     "Blocked private term detected",
                     "Remove environment-specific identifier from repository.",
                     matched_override=term,
+                )
+
+        # 8. User-Facing UI Emoji Guard (RG-UI-001)
+        if is_ui_source_path(rel_path):
+            for em in find_ui_emojis(line, rel_path):
+                emit(
+                    "RG-UI-001",
+                    "ui_emoji",
+                    em.start,
+                    em.end,
+                    f"Emoji detected in user-facing UI source ({em.codepoints}, {em.kind})",
+                    "Remove emoji from user-facing UI; use crisp monochrome inline SVG icons or plain typography instead.",
+                    matched_override=em.codepoints,
                 )
 
         return findings
