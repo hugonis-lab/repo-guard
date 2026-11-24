@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVER_URL="${FORGEJO_RUNNER_LOCAL_URL:-${GITHUB_SERVER_URL}}"
+          SERVER_URL="${SERVER_URL%/}"
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          git init -q .
+          git remote add origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+          if git -c "http.extraHeader=${AUTH_HEADER}" fetch --depth 1 origin "${GITHUB_SHA}" 2>/dev/null; then
+            git checkout -q --detach FETCH_HEAD
+          else
+            git -c "http.extraHeader=${AUTH_HEADER}" fetch --depth 1 origin "${GITHUB_REF}"
+            git checkout -q --detach "${GITHUB_SHA}"
+          fi
+          git log -1 --oneline
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m unittest discover -s tests -v
+
+      - name: Self-audit repository (strict)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 bin/repo-guard audit-repo --strict .
