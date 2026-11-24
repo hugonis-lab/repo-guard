@@ -14,5 +14,10 @@ dependencies = []
 [project.scripts]
 repo-guard = "repo_guard.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/hugonis-lab/repo-guard"
+Repository = "https://github.com/hugonis-lab/repo-guard"
+Issues = "https://github.com/hugonis-lab/repo-guard/issues"
+
 [tool.setuptools.packages.find]
 include = ["repo_guard*"]

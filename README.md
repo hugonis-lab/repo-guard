@@ -9,6 +9,8 @@ Repo Guard runs as global Git hooks (`pre-commit`, `commit-msg`, `pre-push`) and
 Requires Python 3.11+ and Git. Ensure `$HOME/.local/bin` is on your `PATH`.
 
 ```bash
+git clone https://github.com/hugonis-lab/repo-guard.git
+cd repo-guard
 chmod +x bin/repo-guard
 ln -sf "$PWD/bin/repo-guard" "$HOME/.local/bin/repo-guard"
 ```
