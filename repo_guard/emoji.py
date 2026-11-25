@@ -16,6 +16,7 @@ unless explicitly forced into emoji presentation with `U+FE0F`.
 from __future__ import annotations
 
 import bisect
+from functools import lru_cache
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -298,6 +299,7 @@ def format_codepoints(text: str) -> str:
     return " ".join(f"U+{ord(ch):04X}" for ch in text)
 
 
+@lru_cache(maxsize=4096)
 def is_ui_source_path(rel_path: str) -> bool:
     """Return True if rel_path is a user-facing UI source file (excluding tests and fixtures)."""
     if not rel_path:
@@ -319,6 +321,14 @@ def is_ui_source_path(rel_path: str) -> bool:
     return suffix in ALWAYS_UI_EXTENSIONS or suffix in UI_SCRIPT_EXTENSIONS
 
 
+@lru_cache(maxsize=4096)
+def _is_css_path(rel_path: str) -> bool:
+    """Return True if rel_path has a stylesheet extension."""
+    if not rel_path:
+        return False
+    return PurePosixPath(rel_path.replace("\\", "/")).suffix.lower() in CSS_EXTENSIONS
+
+
 def _looks_like_regex_range(line: str, start: int, end: int) -> bool:
     """Avoid false positives on regex character-class ranges such as `[\\u{1F000}-\\u{1FAFF}]`."""
     before = line[start - 1] if start > 0 else ""
@@ -335,6 +345,14 @@ def find_ui_emojis(line: str, rel_path: str = "") -> list[EmojiMatch]:
     if not line:
         return []
 
+    is_ascii = line.isascii()
+    has_entity = "&#" in line
+    has_js_esc = "\\u" in line
+    has_css_esc = "\\" in line and _is_css_path(rel_path)
+    # Every match of LITERAL_EMOJI_RE contains at least one non-ASCII codepoint (>= U+00A9).
+    if is_ascii and not has_entity and not has_js_esc and not has_css_esc:
+        return []
+
     matches: list[EmojiMatch] = []
     seen_spans: set[tuple[int, int]] = set()
 
@@ -344,13 +362,14 @@ def find_ui_emojis(line: str, rel_path: str = "") -> list[EmojiMatch]:
         seen_spans.add((start, end))
         matches.append(EmojiMatch(start=start, end=end, raw=raw, codepoints=codepoints, kind=kind))
 
-    # 1. Literal Unicode emojis
-    for m in LITERAL_EMOJI_RE.finditer(line):
-        raw = m.group(0)
-        _add(m.start(), m.end(), raw, format_codepoints(raw), "literal")
+    # 1. Literal Unicode emojis (impossible on pure-ASCII lines)
+    if not is_ascii:
+        for m in LITERAL_EMOJI_RE.finditer(line):
+            raw = m.group(0)
+            _add(m.start(), m.end(), raw, format_codepoints(raw), "literal")
 
     # 2. HTML numeric/hex entities (&#x1F680;, &#128640;, &#x26A0;&#xFE0F;)
-    if "&#" in line:
+    if has_entity:
         for m in _RE_HTML_ENTITY.finditer(line):
             raw = m.group(0)
             hex_part, dec_part = m.group(1), m.group(2)
@@ -364,7 +383,7 @@ def find_ui_emojis(line: str, rel_path: str = "") -> list[EmojiMatch]:
                 _add(m.start(), m.end(), raw, cps, "html_entity")
 
     # 3. JS/TS Unicode escapes (\u{1F680}, \uD83D\uDE80, \u26A1, \u26A0\uFE0F)
-    if "\\u" in line:
+    if has_js_esc:
         for m in _RE_JS_BRACE_ESC.finditer(line):
             if _looks_like_regex_range(line, m.start(), m.end()):
                 continue
@@ -393,12 +412,12 @@ def find_ui_emojis(line: str, rel_path: str = "") -> list[EmojiMatch]:
                 _add(m.start(), m.end(), m.group(0), cps, "js_escape")
 
     # 4. CSS Unicode escapes in stylesheet files (e.g., content: "\1F680";)
-    suffix = PurePosixPath(rel_path.replace("\\", "/")).suffix.lower() if rel_path else ""
-    if suffix in CSS_EXTENSIONS and "\\" in line:
+    if has_css_esc:
         for m in _RE_CSS_ESC.finditer(line):
             cp = int(m.group(1), 16)
             if is_direct_emoji_codepoint(cp):
                 _add(m.start(), m.end(), m.group(0), f"U+{cp:04X}", "css_escape")
 
-    matches.sort(key=lambda item: item.start)
+    if len(matches) > 1:
+        matches.sort(key=lambda item: item.start)
     return matches

@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -346,6 +347,58 @@ class TestScannerUnit(unittest.TestCase):
                 [],
                 f"Unexpected RG-UI-001 for {rel_path}: {line!r} -> {hits}",
             )
+
+    def test_prefilter_parity_edge_cases_and_linear_time_host_scan(self) -> None:
+        patterns = PrivatePatterns(
+            usernames=["devuser99"],
+            home_paths=["/" + "home" + "/devuser99"],
+            tailnet_domains=["alpha-beta." + "ts" + ".net"],
+            strict_hosts=["lab-node-7", "alpha-beta", "Multi Word Host", "dot.host"],
+            context_hosts=["pointer", "helios", "reefnode", "my.ctx", "ping", "alpha"],
+            strict_only_hosts=["reefnode", "Strict Multi"],
+            private_identities=["Taylor Exampleperson", "texamplehandle", "taylor@" + "private-domain.test"],
+            extra_blocked_terms=["secret-codename", "two words term"],
+        )
+        scanner = RepoScanner(GuardConfig(patterns=patterns.normalized(), strict=True))
+
+        # Verify scan_text matches scan_line identically across tricky context-host,
+        # ordering, Unicode casefold (U+0130, U+0131, U+017F, U+212A), and multi-word rules.
+        lines = [
+            "Hosts: dot.host lab-node-7 alpha-beta Multi   Word Host",
+            "Strict: reefnode Strict  Multi secret-codename two  words\tterm",
+            "Context URL: ht" + "tps://user@helios:8443/v1 and red" + "is://my.ctx:6379",
+            "Context port/tld: pointer:8080 helios.local reefnode.home.arpa",
+            "Context cli: ssh ops@pointer && ssh alpha@alpha && ping ping",
+            "Context repeated cli: ssh a@pointer ssh b@pointer",
+            "Context user@host: a@pointer@pointer and a@b@pointer and @pointer",
+            'Context assign: host = "pointer" server_host: helios vllm_host="my.ctx" host="pointer"foo',
+            "Unicode fold: ht" + "tp://hel\u0130os:8080 host=hel\u0131os host=helio\u017f API_\u212aEY = \"prod_9f8e7d6c5b4a3210\"",
+            "Clean prose with non-ASCII em-dash — pointer-events: none; cursor: pointer;",
+        ]
+        for rel_path in ("ops.sh", "public/app.js"):
+            text = "\n".join(lines) + "\n"
+            via_text = scanner.scan_text(rel_path, text)
+            via_lines = []
+            for idx, line in enumerate(lines, start=1):
+                via_lines.extend(scanner.scan_line(rel_path, idx, line))
+            self.assertEqual(via_text, via_lines, f"scan_text/scan_line mismatch for {rel_path}")
+
+        # Verify exact context-host edge semantics (a@pointer@pointer matches once; @pointer does not match).
+        at_hits = [h for h in scanner.scan_line("ops.sh", 1, "a@pointer@pointer") if h.rule_id == "RG-HOST-002"]
+        self.assertEqual(len(at_hits), 1)
+        bare_at_hits = [h for h in scanner.scan_line("ops.sh", 1, "@pointer") if h.rule_id == "RG-HOST-002"]
+        self.assertEqual(bare_at_hits, [])
+
+        # Regression guard against O(N^2) backtracking on long lines in user@host and cli context rules.
+        t0 = time.perf_counter()
+        self.assertEqual(scanner.scan_line("big.txt", 1, "a" * 50_000 + " @pointer"), [])
+        hit_u = scanner.scan_line("big.txt", 2, "a" * 50_000 + " u@pointer")
+        self.assertTrue(any(h.rule_id == "RG-HOST-002" for h in hit_u))
+        self.assertEqual(scanner.scan_line("big.txt", 3, "ssh " * 5_000 + "foo.pointer"), [])
+        hit_cli = scanner.scan_line("big.txt", 4, "ssh " * 5_000 + "pointer")
+        self.assertTrue(any(h.rule_id == "RG-HOST-002" for h in hit_cli))
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.5, f"Long-line host scan regressed to {elapsed:.3f}s")
 
 
 class TestGitHooksIntegration(unittest.TestCase):

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import fnmatch
+from functools import lru_cache
 import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from .config import HARD_CEILING_CATEGORIES, GuardConfig
-from .emoji import find_ui_emojis, is_ui_source_path
+from .emoji import _is_css_path, find_ui_emojis, is_ui_source_path
 
 # Binary extensions skipped for content scanning (filenames are still checked via RG-FILE-001).
 BINARY_EXTENSIONS: frozenset[str] = frozenset(
@@ -255,6 +256,44 @@ _PRIVATE_TLDS: tuple[str, ...] = (
     ".home.arpa",
 )
 
+# Fast prefix-skip prefilter for _RE_PAN_CANDIDATE matching every valid IIN in _is_likely_pan.
+_RE_PAN_PREFILTER = re.compile(r"[2-6]\d{3}[ -]?\d{4}")
+
+# O(1) hostname/identity token prefiltering helpers.
+_RE_ASCII_HOST_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
+_RE_HOST_TOKEN = re.compile(r"[A-Za-z0-9_-]+")
+# Exhaustive set of non-ASCII Unicode codepoints that match ASCII letters under Python re.IGNORECASE
+# (U+0130 'İ', U+0131 'ı', U+017F 'ſ', U+212A 'K').
+_ASCII_HOST_TOKEN_TRANS: dict[int, str] = {
+    c: (chr(c + 32) if 65 <= c <= 90 else " ")
+    for c in range(128)
+    if not (48 <= c <= 57 or 97 <= c <= 122 or c in (45, 95))
+}
+_BYTES_HOST_TOKEN_TRANS: bytes = bytes(
+    c + 32 if 65 <= c <= 90 else (c if (48 <= c <= 57 or 97 <= c <= 122 or c in (45, 95)) else 32)
+    for c in range(256)
+)
+
+
+def _has_unicode_ascii_fold(text: str) -> bool:
+    """Return True if non-ASCII text contains any codepoint matching ASCII letters under re.IGNORECASE."""
+    return (
+        "\u0130" in text
+        or "\u0131" in text
+        or "\u017f" in text
+        or "\u212a" in text
+    )
+_RE_CTX_CLI_CMD = re.compile(
+    r"\b(?:ssh|scp|sftp|rsync|ping|nc|ncat|telnet|curl|wget)\b",
+    re.IGNORECASE,
+)
+_RE_CTX_ASSIGN_KEY = re.compile(
+    r"\b(?:host|hostname|server|server_host|endpoint|base_host|target_host|"
+    r"remote_host|node|ssh_host|pg_host|db_host|redis_host|ollama_host|vllm_host)\b",
+    re.IGNORECASE,
+)
+_RE_UNIFIED_DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -280,6 +319,7 @@ class Finding:
         }
 
 
+@lru_cache(maxsize=4096)
 def is_binary_path(path: str) -> bool:
     """Return True if filename has a known binary extension."""
     suffix = PurePosixPath(path).suffix.lower()
@@ -443,7 +483,7 @@ def _compile_context_host_patterns(host: str) -> list[re.Pattern[str]]:
             rf"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9._-]+@)?({esc})(?![A-Za-z0-9_.-])",
             re.IGNORECASE,
         ),
-        re.compile(rf"[A-Za-z0-9._-]+@({esc})(?![A-Za-z0-9_.-])", re.IGNORECASE),
+        re.compile(rf"(?<![A-Za-z0-9._-])[A-Za-z0-9._-]+@({esc})(?![A-Za-z0-9_.-])", re.IGNORECASE),
         re.compile(
             rf"\b(?:host|hostname|server|server_host|endpoint|base_host|target_host|"
             rf"remote_host|node|ssh_host|pg_host|db_host|redis_host|ollama_host|vllm_host)\b"
@@ -451,6 +491,128 @@ def _compile_context_host_patterns(host: str) -> list[re.Pattern[str]]:
             re.IGNORECASE,
         ),
     ]
+
+
+@dataclass(frozen=True)
+class _ContextHostEntry:
+    """Precomputed lookup and literal guards for a single context_hosts rule."""
+
+    order: int
+    host: str
+    patterns: list[re.Pattern[str]]
+    cli_host_re: re.Pattern[str]
+    host_lower: str
+    is_ascii: bool
+    port_needle: str
+    tld_needle: str
+    at_needle: str
+
+
+@dataclass(frozen=True)
+class _IndexedRule:
+    """Order-preserving rule entry for token-indexed or anchor-guarded scanning."""
+
+    order: int
+    label: str
+    pattern: re.Pattern[str]
+    first_anchor: str
+    extra_anchors: tuple[str, ...]
+
+
+def _build_indexed_rules(
+    rules: Sequence[tuple[str, re.Pattern[str]]],
+    *,
+    allow_token_index: Callable[[str], bool],
+) -> tuple[dict[str, list[_IndexedRule]], tuple[_IndexedRule, ...]]:
+    """Split compiled rules into exact ASCII token-set lookups and anchor-guarded fallbacks."""
+    token_map: dict[str, list[_IndexedRule]] = {}
+    fallback: list[_IndexedRule] = []
+    for order, (label, pat) in enumerate(rules):
+        cleaned = label.strip()
+        if allow_token_index(cleaned):
+            key = cleaned.lower()
+            token_map.setdefault(key, []).append(_IndexedRule(order, label, pat, key, ()))
+        else:
+            if cleaned.isascii():
+                if " " in cleaned and "@" not in cleaned and "." not in cleaned:
+                    parts = tuple(p.lower() for p in cleaned.split())
+                    first_anchor, extra_anchors = parts[0], parts[1:]
+                else:
+                    first_anchor, extra_anchors = cleaned.lower(), ()
+            else:
+                first_anchor, extra_anchors = "", ()
+            fallback.append(_IndexedRule(order, label, pat, first_anchor, extra_anchors))
+    return token_map, tuple(fallback)
+
+
+def _fallback_matches_text(entry: _IndexedRule, text_lower: str) -> bool:
+    """Return True if a fallback rule's literal anchors all appear in lowercased text."""
+    fa = entry.first_anchor
+    if not fa:
+        return True
+    if fa not in text_lower:
+        return False
+    for extra in entry.extra_anchors:
+        if extra not in text_lower:
+            return False
+    return True
+
+
+def _select_indexed_rules(
+    tokens: list[str] | None,
+    token_map: dict[str, list[_IndexedRule]],
+    fallback: Sequence[_IndexedRule],
+    line_lower: str,
+    can_anchor: bool,
+) -> list[_IndexedRule]:
+    """Return all potentially matching rules in original declaration order."""
+    candidates: list[_IndexedRule] = []
+    if tokens is not None and token_map:
+        seen_tok: set[str] | None = None
+        for tok in tokens:
+            entries = token_map.get(tok)
+            if entries is not None:
+                if seen_tok is None:
+                    seen_tok = {tok}
+                elif tok in seen_tok:
+                    continue
+                else:
+                    seen_tok.add(tok)
+                candidates.extend(entries)
+    if fallback:
+        if can_anchor:
+            for entry in fallback:
+                if _fallback_matches_text(entry, line_lower):
+                    candidates.append(entry)
+        else:
+            candidates.extend(fallback)
+    if len(candidates) > 1:
+        candidates.sort(key=lambda item: item.order)
+    return candidates
+
+
+@dataclass(slots=True)
+class _ScanHints:
+    """Sound file-level (or default all-on) prefilter hints for _scan_line_core."""
+
+    check_secrets: bool
+    check_pan: bool
+    check_secret_assign: bool
+    check_home_path: bool
+    check_ts_net: bool
+    tailnet_domains: tuple[tuple[str, bool, re.Pattern[str]], ...]
+    check_ipv4: bool
+    check_ts_ipv6: bool
+    check_url_port: bool
+    watch_tokens: frozenset[str]
+    watch_token_tuple: tuple[str, ...] | None
+    identity_fallback: tuple[_IndexedRule, ...]
+    strict_host_fallback: tuple[_IndexedRule, ...]
+    context_host_fallback: tuple[_ContextHostEntry, ...]
+    strict_only_fallback: tuple[_IndexedRule, ...]
+    extra_term_fallback: tuple[_IndexedRule, ...]
+    check_ui: bool
+    known_can_anchor: bool
 
 
 class RepoScanner:
@@ -465,6 +627,10 @@ class RepoScanner:
             re.compile(rf"(?<![A-Za-z0-9_.-]){re.escape(d)}(?![A-Za-z0-9_.-])", re.IGNORECASE)
             for d in pats.tailnet_domains
         ]
+        self._tailnet_domain_entries: tuple[tuple[str, bool, re.Pattern[str]], ...] = tuple(
+            (d.lower(), d.isascii(), dom_re)
+            for d, dom_re in zip(pats.tailnet_domains, self._tailnet_domains)
+        )
         self._identity_rules: list[tuple[str, re.Pattern[str]]] = [
             (ident, _compile_identity_pattern(ident))
             for ident in pats.private_identities
@@ -494,6 +660,62 @@ class RepoScanner:
             h.lower()
             for h in (pats.strict_hosts + pats.context_hosts + pats.strict_only_hosts)
         }
+
+        # Precompute O(1) token indices and literal guards preserving exact declaration order.
+        is_ascii_host = lambda s: bool(_RE_ASCII_HOST_TOKEN.match(s))
+        is_ascii_ident_tok = lambda s: (
+            "@" not in s and "." not in s and " " not in s and bool(_RE_ASCII_HOST_TOKEN.match(s))
+        )
+        self._identity_token_map, self._identity_fallback = _build_indexed_rules(
+            self._identity_rules, allow_token_index=is_ascii_ident_tok
+        )
+        self._strict_host_token_map, self._strict_host_fallback = _build_indexed_rules(
+            self._strict_host_rules, allow_token_index=is_ascii_host
+        )
+        self._strict_only_token_map, self._strict_only_fallback = _build_indexed_rules(
+            self._strict_only_host_rules, allow_token_index=is_ascii_host
+        )
+        self._extra_term_token_map, self._extra_term_fallback = _build_indexed_rules(
+            self._extra_terms, allow_token_index=is_ascii_host
+        )
+
+        self._context_host_entries: list[_ContextHostEntry] = []
+        self._context_host_token_map: dict[str, list[_ContextHostEntry]] = {}
+        ctx_fallback: list[_ContextHostEntry] = []
+        for order, (host, patterns) in enumerate(self._context_host_rules):
+            cleaned = host.strip()
+            cleaned_low = cleaned.lower()
+            esc = re.escape(cleaned)
+            entry = _ContextHostEntry(
+                order=order,
+                host=host,
+                patterns=patterns,
+                cli_host_re=re.compile(rf"(?<![A-Za-z0-9_.-])(?:{esc})(?![A-Za-z0-9_.-])", re.IGNORECASE),
+                host_lower=cleaned_low,
+                is_ascii=cleaned.isascii(),
+                port_needle=f"{cleaned_low}:",
+                tld_needle=f"{cleaned_low}.",
+                at_needle=f"@{cleaned_low}",
+            )
+            self._context_host_entries.append(entry)
+            if is_ascii_host(cleaned):
+                self._context_host_token_map.setdefault(cleaned_low, []).append(entry)
+            else:
+                ctx_fallback.append(entry)
+
+        self._context_host_fallback: tuple[_ContextHostEntry, ...] = tuple(ctx_fallback)
+        normal_watch: set[str] = set()
+        normal_watch.update(self._identity_token_map)
+        normal_watch.update(self._strict_host_token_map)
+        normal_watch.update(self._context_host_token_map)
+        normal_watch.update(self._extra_term_token_map)
+        self._watch_tokens_normal: frozenset[str] = frozenset(normal_watch)
+        self._watch_tokens_strict: frozenset[str] = frozenset(normal_watch | set(self._strict_only_token_map))
+        self._watch_bytes_normal: frozenset[bytes] = frozenset(t.encode("ascii") for t in self._watch_tokens_normal)
+        self._watch_bytes_strict: frozenset[bytes] = frozenset(t.encode("ascii") for t in self._watch_tokens_strict)
+        self._has_repo_policy: bool = bool(
+            config.repo_policy.allow_paths or config.repo_policy.allow_terms
+        )
 
     def check_filename(self, rel_path: str) -> list[Finding]:
         """Check a repository-relative filename against RG-FILE-001."""
@@ -592,13 +814,186 @@ class RepoScanner:
                     )
         return findings
 
-    def scan_line(self, rel_path: str, line_no: int, line: str) -> list[Finding]:
-        """Scan a single line and return all deterministic findings."""
-        if not line or not line.strip():
+    def _scan_context_host_entry(
+        self,
+        entry: _ContextHostEntry,
+        line: str,
+        line_lower: str,
+        can_anchor: bool,
+        has_url_sep: bool,
+        has_assign_punct: bool,
+        emit: Callable[..., None],
+    ) -> None:
+        """Evaluate the 6 context-host patterns for one host with O(N) literal pre-guards."""
+        host = entry.host
+        pats = entry.patterns
+        entry_anchor = can_anchor and entry.is_ascii
+
+        def emit_ctx(m: re.Match[str]) -> None:
+            start = m.start(1) if m.lastindex else m.start()
+            end = m.end(1) if m.lastindex else m.end()
+            emit(
+                "RG-HOST-002",
+                "private_host_context",
+                start,
+                end,
+                "Private hostname used in network/host configuration context",
+                "Replace hardcoded host reference with an environment variable or 127.0.0.1/example.com placeholder (12-Factor III & IV).",
+                matched_override=host,
+            )
+
+        # pat[0]: scheme://...@host...
+        if has_url_sep:
+            matched = False
+            for m in pats[0].finditer(line):
+                emit_ctx(m)
+                matched = True
+            if matched:
+                return
+
+        # pat[1]: host:port
+        if (not entry_anchor) or (entry.port_needle in line_lower):
+            matched = False
+            for m in pats[1].finditer(line):
+                emit_ctx(m)
+                matched = True
+            if matched:
+                return
+
+        # pat[2]: host.<private-tld>
+        if (not entry_anchor) or (entry.tld_needle in line_lower):
+            matched = False
+            for m in pats[2].finditer(line):
+                emit_ctx(m)
+                matched = True
+            if matched:
+                return
+
+        # pat[3]: ssh/scp/curl/... host (guarded so repeated CLI words without host stay O(N))
+        m_cmd = _RE_CTX_CLI_CMD.search(line)
+        if m_cmd is not None and entry.cli_host_re.search(line, m_cmd.end()) is not None:
+            matched = False
+            pos = m_cmd.start()
+            while True:
+                m = pats[3].search(line, pos)
+                if m is None:
+                    break
+                emit_ctx(m)
+                matched = True
+                pos = m.end()
+                next_cmd = _RE_CTX_CLI_CMD.search(line, pos)
+                if next_cmd is None or entry.cli_host_re.search(line, next_cmd.end()) is None:
+                    break
+                pos = next_cmd.start()
+            if matched:
+                return
+
+        # pat[4]: user@host
+        if "@" in line and ((not entry_anchor) or (entry.at_needle in line_lower)):
+            matched = False
+            for m in pats[4].finditer(line):
+                emit_ctx(m)
+                matched = True
+            if matched:
+                return
+
+        # pat[5]: host_key = host
+        if has_assign_punct and _RE_CTX_ASSIGN_KEY.search(line) is not None:
+            for m in pats[5].finditer(line):
+                emit_ctx(m)
+
+    def _scan_indexed_bucket(
+        self,
+        *,
+        line: str,
+        line_lower: str,
+        can_anchor: bool,
+        active_tokens: list[str] | None,
+        all_rules: Sequence[tuple[str, re.Pattern[str]]],
+        token_map: dict[str, list[_IndexedRule]],
+        fallback: Sequence[_IndexedRule],
+        rule_id: str,
+        category: str,
+        message: str,
+        remediation: str,
+        emit: Callable[..., None],
+    ) -> None:
+        """Scan a token-indexed + anchor-guarded rule bucket preserving exact declaration order."""
+        if not can_anchor:
+            for label, pat in all_rules:
+                for m in pat.finditer(line):
+                    emit(rule_id, category, m.start(), m.end(), message, remediation, matched_override=label)
+            return
+        if active_tokens is None:
+            for rule in fallback:
+                if _fallback_matches_text(rule, line_lower):
+                    for m in rule.pattern.finditer(line):
+                        emit(rule_id, category, m.start(), m.end(), message, remediation, matched_override=rule.label)
+            return
+        for rule in _select_indexed_rules(active_tokens, token_map, fallback, line_lower, True):
+            for m in rule.pattern.finditer(line):
+                emit(rule_id, category, m.start(), m.end(), message, remediation, matched_override=rule.label)
+
+    def _emit_finding(
+        self,
+        findings: list[Finding],
+        seen_keys: set[tuple[str, int]],
+        rel_path: str,
+        line_no: int,
+        line: str,
+        rule_id: str,
+        category: str,
+        start: int,
+        end: int,
+        message: str,
+        remediation: str,
+        matched_override: str | None = None,
+    ) -> None:
+        if self._has_repo_policy and category not in HARD_CEILING_CATEGORIES:
+            matched_text = matched_override if matched_override is not None else line[start:end]
+            if _is_allowed_by_repo_policy(
+                self.config,
+                category=category,
+                rel_path=rel_path,
+                matched_text=matched_text,
+            ):
+                return
+        dedup_key = (rule_id, start)
+        if dedup_key in seen_keys:
+            return
+        seen_keys.add(dedup_key)
+        findings.append(
+            Finding(
+                rule_id=rule_id,
+                category=category,
+                path=rel_path,
+                line=line_no,
+                message=message,
+                snippet=_redact_snippet(
+                    line,
+                    start,
+                    end,
+                    rule_id=rule_id,
+                    category=category,
+                ),
+                remediation=remediation,
+            )
+        )
+
+    def _scan_line_core(
+        self,
+        rel_path: str,
+        line_no: int,
+        line: str,
+        hints: _ScanHints,
+    ) -> list[Finding]:
+        """Core single-line scanner parameterized by sound file-level or default hints."""
+        if not line or line.isspace():
             return []
 
-        findings: list[Finding] = []
-        seen_keys: set[tuple[str, int]] = set()
+        findings: list[Finding] | None = None
+        seen_keys: set[tuple[str, int]] | None = None
+        emit_fn = self._emit_finding
 
         def emit(
             rule_id: str,
@@ -609,306 +1004,442 @@ class RepoScanner:
             remediation: str,
             matched_override: str | None = None,
         ) -> None:
-            matched_text = matched_override if matched_override is not None else line[start:end]
-            if _is_allowed_by_repo_policy(
-                self.config,
-                category=category,
-                rel_path=rel_path,
-                matched_text=matched_text,
-            ):
-                return
-            dedup_key = (rule_id, start)
-            if dedup_key in seen_keys:
-                return
-            seen_keys.add(dedup_key)
-            findings.append(
-                Finding(
-                    rule_id=rule_id,
-                    category=category,
-                    path=rel_path,
-                    line=line_no,
-                    message=message,
-                    snippet=_redact_snippet(
-                        line,
-                        start,
-                        end,
-                        rule_id=rule_id,
-                        category=category,
-                    ),
-                    remediation=remediation,
-                )
+            nonlocal findings, seen_keys
+            if findings is None:
+                findings = []
+                seen_keys = set()
+            assert seen_keys is not None
+            emit_fn(
+                findings,
+                seen_keys,
+                rel_path,
+                line_no,
+                line,
+                rule_id,
+                category,
+                start,
+                end,
+                message,
+                remediation,
+                matched_override,
             )
 
+        is_ascii = line.isascii()
+        can_anchor = hints.known_can_anchor or is_ascii or (not _has_unicode_ascii_fold(line))
+        line_lower = ""
+
+        has_colon = ":" in line
+        has_eq = "=" in line
+        has_assign_punct = has_eq or has_colon
+        has_url_sep = has_colon and ("://" in line)
+        has_dot = "." in line
+
         # 1. Secrets & Credentials (RG-SEC-001..009) — HARD CEILING
-        secret_specs: tuple[tuple[str, re.Pattern[str], str, str], ...] = (
-            (
-                "RG-SEC-001",
-                _RE_PRIVATE_KEY,
-                "Private key block header detected",
-                "Remove private key material from source; load via env var or secret manager (12-Factor III).",
-            ),
-            (
-                "RG-SEC-002",
-                _RE_AWS_KEY,
-                "AWS access key ID detected",
-                "Remove AWS key; authenticate via IAM role or environment variables (12-Factor III).",
-            ),
-            (
-                "RG-SEC-003",
-                _RE_GITHUB_TOKEN,
-                "GitHub personal/app token detected",
-                "Remove GitHub token; read from GITHUB_TOKEN environment variable (12-Factor III).",
-            ),
-            (
-                "RG-SEC-004",
-                _RE_STRIPE_KEY,
-                "Stripe API key detected",
-                "Remove Stripe key; inject via STRIPE_SECRET_KEY environment variable (12-Factor III).",
-            ),
-            (
-                "RG-SEC-005",
-                _RE_AI_API_KEY,
-                "OpenAI/Anthropic API key detected",
-                "Remove LLM API key; load from environment variable (12-Factor III).",
-            ),
-            (
-                "RG-SEC-006",
-                _RE_SLACK_TOKEN,
-                "Slack token detected",
-                "Remove Slack token; inject via environment variable (12-Factor III).",
-            ),
-            (
-                "RG-SEC-007",
-                _RE_JWT,
-                "JSON Web Token (JWT) detected",
-                "Remove hardcoded JWT; issue or fetch tokens dynamically at runtime.",
-            ),
-        )
-        for rule_id, pat, msg, hint in secret_specs:
-            for m in pat.finditer(line):
-                emit(rule_id, "secret", m.start(), m.end(), msg, hint)
-
-        for m in _RE_PAN_CANDIDATE.finditer(line):
-            raw_pan = m.group(1)
-            if _is_likely_pan(raw_pan):
-                emit(
-                    "RG-SEC-008",
-                    "secret",
-                    m.start(1),
-                    m.end(1),
-                    "Luhn-valid payment card number (PAN) detected",
-                    "Remove payment card numbers immediately; never commit PANs to source or tests.",
-                )
-
-        # RG-SEC-009: Hardcoded non-placeholder secret assignment
-        for assign_re in (_RE_SECRET_ASSIGN_QUOTED, _RE_SECRET_ASSIGN_ENV):
-            for m in assign_re.finditer(line):
-                val = m.group(1)
-                if not _is_placeholder_secret(val):
+        if hints.check_secrets:
+            if "PRIVATE KEY-----" in line:
+                for m in _RE_PRIVATE_KEY.finditer(line):
                     emit(
-                        "RG-SEC-009",
+                        "RG-SEC-001",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "Private key block header detected",
+                        "Remove private key material from source; load via env var or secret manager (12-Factor III).",
+                    )
+            if "AKIA" in line or "ASIA" in line:
+                for m in _RE_AWS_KEY.finditer(line):
+                    emit(
+                        "RG-SEC-002",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "AWS access key ID detected",
+                        "Remove AWS key; authenticate via IAM role or environment variables (12-Factor III).",
+                    )
+            if "_" in line and (
+                "ghp_" in line
+                or "gho_" in line
+                or "ghu_" in line
+                or "ghs_" in line
+                or "ghr_" in line
+                or "github_pat_" in line
+            ):
+                for m in _RE_GITHUB_TOKEN.finditer(line):
+                    emit(
+                        "RG-SEC-003",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "GitHub personal/app token detected",
+                        "Remove GitHub token; read from GITHUB_TOKEN environment variable (12-Factor III).",
+                    )
+            if "k_live_" in line or "k_test_" in line:
+                for m in _RE_STRIPE_KEY.finditer(line):
+                    emit(
+                        "RG-SEC-004",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "Stripe API key detected",
+                        "Remove Stripe key; inject via STRIPE_SECRET_KEY environment variable (12-Factor III).",
+                    )
+            if "sk-" in line:
+                for m in _RE_AI_API_KEY.finditer(line):
+                    emit(
+                        "RG-SEC-005",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "OpenAI/Anthropic API key detected",
+                        "Remove LLM API key; load from environment variable (12-Factor III).",
+                    )
+            if "xox" in line:
+                for m in _RE_SLACK_TOKEN.finditer(line):
+                    emit(
+                        "RG-SEC-006",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "Slack token detected",
+                        "Remove Slack token; inject via environment variable (12-Factor III).",
+                    )
+            if "eyJ" in line:
+                for m in _RE_JWT.finditer(line):
+                    emit(
+                        "RG-SEC-007",
+                        "secret",
+                        m.start(),
+                        m.end(),
+                        "JSON Web Token (JWT) detected",
+                        "Remove hardcoded JWT; issue or fetch tokens dynamically at runtime.",
+                    )
+
+        if hints.check_pan and len(line) >= 15 and _RE_PAN_PREFILTER.search(line) is not None:
+            for m in _RE_PAN_CANDIDATE.finditer(line):
+                raw_pan = m.group(1)
+                if _is_likely_pan(raw_pan):
+                    emit(
+                        "RG-SEC-008",
                         "secret",
                         m.start(1),
                         m.end(1),
-                        "Hardcoded non-placeholder secret assignment detected",
-                        "Load secrets from environment variables and commit only placeholder templates in .env.example (12-Factor III).",
+                        "Luhn-valid payment card number (PAN) detected",
+                        "Remove payment card numbers immediately; never commit PANs to source or tests.",
                     )
+
+        # RG-SEC-009: Hardcoded non-placeholder secret assignment
+        if hints.check_secret_assign and has_assign_punct:
+            if not line_lower:
+                line_lower = line.lower()
+            if (
+                (not can_anchor)
+                or "key" in line_lower
+                or "secret" in line_lower
+                or "token" in line_lower
+                or "passw" in line_lower
+            ):
+                if '"' in line or "'" in line:
+                    for m in _RE_SECRET_ASSIGN_QUOTED.finditer(line):
+                        val = m.group(1)
+                        if not _is_placeholder_secret(val):
+                            emit(
+                                "RG-SEC-009",
+                                "secret",
+                                m.start(1),
+                                m.end(1),
+                                "Hardcoded non-placeholder secret assignment detected",
+                                "Load secrets from environment variables and commit only placeholder templates in .env.example (12-Factor III).",
+                            )
+                if has_eq:
+                    for m in _RE_SECRET_ASSIGN_ENV.finditer(line):
+                        val = m.group(1)
+                        if not _is_placeholder_secret(val):
+                            emit(
+                                "RG-SEC-009",
+                                "secret",
+                                m.start(1),
+                                m.end(1),
+                                "Hardcoded non-placeholder secret assignment detected",
+                                "Load secrets from environment variables and commit only placeholder templates in .env.example (12-Factor III).",
+                            )
 
         # 2. Hardcoded Home / OS Paths (RG-PATH-001) — HARD CEILING
-        path_matched_spans: set[tuple[int, int]] = set()
-        for m in _RE_HOME_PATH.finditer(line):
-            user_part = (m.group(1) or m.group(2) or "").strip()
-            low_user = user_part.lower()
-            is_local_user = low_user in self._usernames_lower
-            is_generic_placeholder = low_user in GENERIC_PLACEHOLDER_USERS and not is_local_user
-            if not is_generic_placeholder:
-                path_matched_spans.add((m.start(), m.end()))
-                emit(
-                    "RG-PATH-001",
-                    "home_path",
-                    m.start(),
-                    m.end(),
-                    "Hardcoded user home directory path detected (violates 12-Factor III)",
-                    "Use Path.home(), os.homedir(), $HOME, or $XDG_CONFIG_HOME instead of hardcoded user paths.",
-                )
+        if hints.check_home_path:
+            path_matched_spans: set[tuple[int, int]] | None = None
+            if "/home/" in line or "Users" in line:
+                for m in _RE_HOME_PATH.finditer(line):
+                    user_part = (m.group(1) or m.group(2) or "").strip()
+                    low_user = user_part.lower()
+                    is_local_user = low_user in self._usernames_lower
+                    is_generic_placeholder = low_user in GENERIC_PLACEHOLDER_USERS and not is_local_user
+                    if not is_generic_placeholder:
+                        if path_matched_spans is None:
+                            path_matched_spans = set()
+                        path_matched_spans.add((m.start(), m.end()))
+                        emit(
+                            "RG-PATH-001",
+                            "home_path",
+                            m.start(),
+                            m.end(),
+                            "Hardcoded user home directory path detected (violates 12-Factor III)",
+                            "Use Path.home(), os.homedir(), $HOME, or $XDG_CONFIG_HOME instead of hardcoded user paths.",
+                        )
 
-        for hp in self._home_paths:
-            idx = line.find(hp)
-            while idx != -1:
-                span = (idx, idx + len(hp))
-                if not any(s <= span[0] and e >= span[1] for s, e in path_matched_spans):
-                    emit(
-                        "RG-PATH-001",
-                        "home_path",
-                        span[0],
-                        span[1],
-                        "Hardcoded local $HOME path detected (violates 12-Factor III)",
-                        "Use Path.home(), os.homedir(), $HOME, or $XDG_CONFIG_HOME instead of hardcoded user paths.",
-                    )
-                idx = line.find(hp, idx + len(hp))
+            for hp in self._home_paths:
+                idx = line.find(hp)
+                while idx != -1:
+                    span = (idx, idx + len(hp))
+                    if path_matched_spans is None or not any(s <= span[0] and e >= span[1] for s, e in path_matched_spans):
+                        emit(
+                            "RG-PATH-001",
+                            "home_path",
+                            span[0],
+                            span[1],
+                            "Hardcoded local $HOME path detected (violates 12-Factor III)",
+                            "Use Path.home(), os.homedir(), $HOME, or $XDG_CONFIG_HOME instead of hardcoded user paths.",
+                        )
+                    idx = line.find(hp, idx + len(hp))
 
         # 3. Tailnet FQDNs (RG-NET-001) — HARD CEILING
-        for m in _RE_TS_NET.finditer(line):
-            emit(
-                "RG-NET-001",
-                "tailnet_fqdn",
-                m.start(1),
-                m.end(1),
-                "Tailnet *.ts.net FQDN detected",
-                "Replace hardcoded tailnet FQDN with a configurable service URL env var (12-Factor III & IV).",
-            )
-        for dom_re in self._tailnet_domains:
-            for m in dom_re.finditer(line):
-                emit(
-                    "RG-NET-001",
-                    "tailnet_fqdn",
-                    m.start(),
-                    m.end(),
-                    "Configured private tailnet domain detected",
-                    "Replace hardcoded tailnet domain with a configurable service URL env var (12-Factor III & IV).",
-                )
-
-        # 4. Private LAN & CGNAT IPs (RG-NET-002, RG-NET-003) — HARD CEILING
-        for m in _RE_IPV4.finditer(line):
-            raw_ip = m.group(1)
-            try:
-                addr = ipaddress.IPv4Address(raw_ip)
-            except ipaddress.AddressValueError:
-                continue
-            if addr in _LOOPBACK_IPV4_NET or addr in _UNSPECIFIED_IPV4_NET:
-                continue
-            if any(addr in net for net in _DOC_IPV4_NETS):
-                continue
-            if any(addr in net for net in _RFC1918_NETS):
-                emit(
-                    "RG-NET-002",
-                    "private_ip",
-                    m.start(1),
-                    m.end(1),
-                    "RFC 1918 private LAN IPv4 address detected",
-                    "Replace hardcoded LAN IP with 127.0.0.1, an RFC 5737 doc IP (192.0.2.1), or an env var (12-Factor III & IV).",
-                )
-            elif addr in _CGNAT_NET:
-                emit(
-                    "RG-NET-003",
-                    "private_ip",
-                    m.start(1),
-                    m.end(1),
-                    "Tailscale/CGNAT IPv4 address (100.64/10) detected",
-                    "Replace hardcoded tailnet IP with a configurable env var (12-Factor III & IV).",
-                )
-
-        for m in _RE_TS_IPV6.finditer(line):
-            emit(
-                "RG-NET-003",
-                "private_ip",
-                m.start(1),
-                m.end(1),
-                "Tailscale ULA IPv6 address detected",
-                "Replace hardcoded tailnet IPv6 address with a configurable env var (12-Factor III & IV).",
-            )
-
-        # 5. Hardcoded non-loopback private http(s)/ws(s)://<host>:<port> URLs (RG-NET-004)
-        for m in _RE_URL_WITH_PORT.finditer(line):
-            host = m.group(1).lower()
-            if host in _ALLOWED_URL_HOSTS or host.endswith(".example") or host.endswith(".example.com"):
-                continue
-            if host.endswith(".ts.net"):
-                continue  # Already caught by RG-NET-001.
-            # Skip raw IPs (already handled by RG-NET-002/003 or allowed loopback/doc IP).
-            try:
-                ipaddress.IPv4Address(host)
-                continue
-            except ipaddress.AddressValueError:
-                pass
-            is_private_url_host = (
-                host in self._all_configured_hosts
-                or any(host.endswith(tld) for tld in _PRIVATE_TLDS)
-                or "." not in host
-            )
-            if is_private_url_host:
-                emit(
-                    "RG-NET-004",
-                    "private_url",
-                    m.start(),
-                    m.end(),
-                    "Hardcoded non-loopback internal service URL with port detected",
-                    "Inject backing-service URLs via env vars (e.g., API_BASE_URL), defaulting only to http://127.0.0.1:<port> (12-Factor IV).",
-                    matched_override=host,
-                )
-
-        # 6. Personal Identity Patterns (RG-ID-001) — HARD CEILING
-        for ident, pat in self._identity_rules:
-            for m in pat.finditer(line):
-                emit(
-                    "RG-ID-001",
-                    "personal_identity",
-                    m.start(),
-                    m.end(),
-                    "Private personal identity/handle/domain detected",
-                    "Remove personal names, handles, emails, and private domains from open-source files.",
-                    matched_override=ident,
-                )
-
-        # 7. Private Hostnames (RG-HOST-001, RG-HOST-002, RG-HOST-003)
-        for host, pat in self._strict_host_rules:
-            for m in pat.finditer(line):
-                emit(
-                    "RG-HOST-001",
-                    "private_host",
-                    m.start(),
-                    m.end(),
-                    "Private infrastructure hostname detected",
-                    "Remove machine-specific hostname; configure host via environment variable (12-Factor III & IV).",
-                    matched_override=host,
-                )
-
-        for host, patterns in self._context_host_rules:
-            matched_ctx = False
-            for pat in patterns:
-                for m in pat.finditer(line):
-                    start = m.start(1) if m.lastindex else m.start()
-                    end = m.end(1) if m.lastindex else m.end()
+        if hints.check_ts_net and has_dot:
+            if not line_lower:
+                line_lower = line.lower()
+            if (not can_anchor) or (".ts.net" in line_lower):
+                for m in _RE_TS_NET.finditer(line):
                     emit(
-                        "RG-HOST-002",
-                        "private_host_context",
-                        start,
-                        end,
-                        "Private hostname used in network/host configuration context",
-                        "Replace hardcoded host reference with an environment variable or 127.0.0.1/example.com placeholder (12-Factor III & IV).",
-                        matched_override=host,
+                        "RG-NET-001",
+                        "tailnet_fqdn",
+                        m.start(1),
+                        m.end(1),
+                        "Tailnet *.ts.net FQDN detected",
+                        "Replace hardcoded tailnet FQDN with a configurable service URL env var (12-Factor III & IV).",
                     )
-                    matched_ctx = True
-                if matched_ctx:
-                    break
-
-        if self.config.strict:
-            for host, pat in self._strict_only_host_rules:
-                for m in pat.finditer(line):
+        if hints.tailnet_domains:
+            if not line_lower:
+                line_lower = line.lower()
+            for dom_low, dom_is_ascii, dom_re in hints.tailnet_domains:
+                if can_anchor and dom_is_ascii and dom_low not in line_lower:
+                    continue
+                for m in dom_re.finditer(line):
                     emit(
-                        "RG-HOST-003",
-                        "private_host_strict",
+                        "RG-NET-001",
+                        "tailnet_fqdn",
                         m.start(),
                         m.end(),
-                        "Local infrastructure hostname detected in --strict OSS mode",
-                        "Remove environment-specific node references before open-sourcing (12-Factor III).",
+                        "Configured private tailnet domain detected",
+                        "Replace hardcoded tailnet domain with a configurable service URL env var (12-Factor III & IV).",
+                    )
+
+        # 4. Private LAN & CGNAT IPs (RG-NET-002, RG-NET-003) — HARD CEILING
+        if hints.check_ipv4 and has_dot and (
+            "10." in line or "172." in line or "192.168." in line or "100." in line
+        ) and line.count(".") >= 3:
+            for m in _RE_IPV4.finditer(line):
+                raw_ip = m.group(1)
+                try:
+                    addr = ipaddress.IPv4Address(raw_ip)
+                except ipaddress.AddressValueError:
+                    continue
+                if addr in _LOOPBACK_IPV4_NET or addr in _UNSPECIFIED_IPV4_NET:
+                    continue
+                if any(addr in net for net in _DOC_IPV4_NETS):
+                    continue
+                if any(addr in net for net in _RFC1918_NETS):
+                    emit(
+                        "RG-NET-002",
+                        "private_ip",
+                        m.start(1),
+                        m.end(1),
+                        "RFC 1918 private LAN IPv4 address detected",
+                        "Replace hardcoded LAN IP with 127.0.0.1, an RFC 5737 doc IP (192.0.2.1), or an env var (12-Factor III & IV).",
+                    )
+                elif addr in _CGNAT_NET:
+                    emit(
+                        "RG-NET-003",
+                        "private_ip",
+                        m.start(1),
+                        m.end(1),
+                        "Tailscale/CGNAT IPv4 address (100.64/10) detected",
+                        "Replace hardcoded tailnet IP with a configurable env var (12-Factor III & IV).",
+                    )
+
+        if hints.check_ts_ipv6 and has_colon:
+            if not line_lower:
+                line_lower = line.lower()
+            if (not can_anchor) or ("fd7a:115c:a1e0:" in line_lower):
+                for m in _RE_TS_IPV6.finditer(line):
+                    emit(
+                        "RG-NET-003",
+                        "private_ip",
+                        m.start(1),
+                        m.end(1),
+                        "Tailscale ULA IPv6 address detected",
+                        "Replace hardcoded tailnet IPv6 address with a configurable env var (12-Factor III & IV).",
+                    )
+
+        # 5. Hardcoded non-loopback private http(s)/ws(s)://<host>:<port> URLs (RG-NET-004)
+        if hints.check_url_port and has_url_sep:
+            for m in _RE_URL_WITH_PORT.finditer(line):
+                host = m.group(1).lower()
+                if host in _ALLOWED_URL_HOSTS or host.endswith(".example") or host.endswith(".example.com"):
+                    continue
+                if host.endswith(".ts.net"):
+                    continue  # Already caught by RG-NET-001.
+                # Skip raw IPs (already handled by RG-NET-002/003 or allowed loopback/doc IP).
+                try:
+                    ipaddress.IPv4Address(host)
+                    continue
+                except ipaddress.AddressValueError:
+                    pass
+                is_private_url_host = (
+                    host in self._all_configured_hosts
+                    or any(host.endswith(tld) for tld in _PRIVATE_TLDS)
+                    or "." not in host
+                )
+                if is_private_url_host:
+                    emit(
+                        "RG-NET-004",
+                        "private_url",
+                        m.start(),
+                        m.end(),
+                        "Hardcoded non-loopback internal service URL with port detected",
+                        "Inject backing-service URLs via env vars (e.g., API_BASE_URL), defaulting only to http://127.0.0.1:<port> (12-Factor IV).",
                         matched_override=host,
                     )
 
-        for term, pat in self._extra_terms:
-            for m in pat.finditer(line):
-                emit(
-                    "RG-HOST-001",
-                    "private_host",
-                    m.start(),
-                    m.end(),
-                    "Blocked private term detected",
-                    "Remove environment-specific identifier from repository.",
-                    matched_override=term,
+        # Tokenize once for O(1) lookup across identities, strict/context/strict-only hosts, and extra terms.
+        active_tokens: list[str] | None = None
+        if can_anchor and hints.watch_tokens:
+            may_have_token = True
+            tok_tuple = hints.watch_token_tuple
+            if tok_tuple is not None:
+                if not line_lower:
+                    line_lower = line.lower()
+                may_have_token = False
+                for tok_needle in tok_tuple:
+                    if tok_needle in line_lower:
+                        may_have_token = True
+                        break
+            if may_have_token:
+                if is_ascii:
+                    raw_tokens = line.translate(_ASCII_HOST_TOKEN_TRANS).split()
+                else:
+                    if not line_lower:
+                        line_lower = line.lower()
+                    raw_tokens = _RE_HOST_TOKEN.findall(line_lower)
+                if not hints.watch_tokens.isdisjoint(raw_tokens):
+                    active_tokens = raw_tokens
+
+        # 6. Personal Identity Patterns (RG-ID-001) — HARD CEILING
+        if (not can_anchor) or active_tokens is not None or hints.identity_fallback:
+            if not line_lower:
+                line_lower = line.lower()
+            self._scan_indexed_bucket(
+                line=line,
+                line_lower=line_lower,
+                can_anchor=can_anchor,
+                active_tokens=active_tokens,
+                all_rules=self._identity_rules,
+                token_map=self._identity_token_map,
+                fallback=hints.identity_fallback,
+                rule_id="RG-ID-001",
+                category="personal_identity",
+                message="Private personal identity/handle/domain detected",
+                remediation="Remove personal names, handles, emails, and private domains from open-source files.",
+                emit=emit,
+            )
+
+        # 7. Private Hostnames (RG-HOST-001, RG-HOST-002, RG-HOST-003)
+        if (not can_anchor) or active_tokens is not None or hints.strict_host_fallback:
+            if not line_lower:
+                line_lower = line.lower()
+            self._scan_indexed_bucket(
+                line=line,
+                line_lower=line_lower,
+                can_anchor=can_anchor,
+                active_tokens=active_tokens,
+                all_rules=self._strict_host_rules,
+                token_map=self._strict_host_token_map,
+                fallback=hints.strict_host_fallback,
+                rule_id="RG-HOST-001",
+                category="private_host",
+                message="Private infrastructure hostname detected",
+                remediation="Remove machine-specific hostname; configure host via environment variable (12-Factor III & IV).",
+                emit=emit,
+            )
+
+        if not can_anchor:
+            if not line_lower:
+                line_lower = line.lower()
+            for entry in self._context_host_entries:
+                self._scan_context_host_entry(
+                    entry, line, line_lower, False, has_url_sep, has_assign_punct, emit
+                )
+        elif active_tokens is not None or hints.context_host_fallback:
+            if not line_lower:
+                line_lower = line.lower()
+            ctx_candidates: list[_ContextHostEntry] = []
+            if active_tokens is not None and self._context_host_token_map:
+                seen_ctx_tok: set[str] | None = None
+                for tok in active_tokens:
+                    entries = self._context_host_token_map.get(tok)
+                    if entries is not None:
+                        if seen_ctx_tok is None:
+                            seen_ctx_tok = {tok}
+                        elif tok in seen_ctx_tok:
+                            continue
+                        else:
+                            seen_ctx_tok.add(tok)
+                        ctx_candidates.extend(entries)
+            if hints.context_host_fallback:
+                for entry in hints.context_host_fallback:
+                    if (not entry.is_ascii) or (entry.host_lower in line_lower):
+                        ctx_candidates.append(entry)
+            if len(ctx_candidates) > 1:
+                ctx_candidates.sort(key=lambda item: item.order)
+            for entry in ctx_candidates:
+                self._scan_context_host_entry(
+                    entry, line, line_lower, True, has_url_sep, has_assign_punct, emit
                 )
 
+        if self.config.strict and ((not can_anchor) or active_tokens is not None or hints.strict_only_fallback):
+            if not line_lower:
+                line_lower = line.lower()
+            self._scan_indexed_bucket(
+                line=line,
+                line_lower=line_lower,
+                can_anchor=can_anchor,
+                active_tokens=active_tokens,
+                all_rules=self._strict_only_host_rules,
+                token_map=self._strict_only_token_map,
+                fallback=hints.strict_only_fallback,
+                rule_id="RG-HOST-003",
+                category="private_host_strict",
+                message="Local infrastructure hostname detected in --strict OSS mode",
+                remediation="Remove environment-specific node references before open-sourcing (12-Factor III).",
+                emit=emit,
+            )
+
+        if (not can_anchor) or active_tokens is not None or hints.extra_term_fallback:
+            if not line_lower:
+                line_lower = line.lower()
+            self._scan_indexed_bucket(
+                line=line,
+                line_lower=line_lower,
+                can_anchor=can_anchor,
+                active_tokens=active_tokens,
+                all_rules=self._extra_terms,
+                token_map=self._extra_term_token_map,
+                fallback=hints.extra_term_fallback,
+                rule_id="RG-HOST-001",
+                category="private_host",
+                message="Blocked private term detected",
+                remediation="Remove environment-specific identifier from repository.",
+                emit=emit,
+            )
+
         # 8. User-Facing UI Emoji Guard (RG-UI-001)
-        if is_ui_source_path(rel_path):
+        if hints.check_ui:
             for em in find_ui_emojis(line, rel_path):
                 emit(
                     "RG-UI-001",
@@ -920,13 +1451,172 @@ class RepoScanner:
                     matched_override=em.codepoints,
                 )
 
-        return findings
+        return findings if findings is not None else []
+
+    def scan_line(self, rel_path: str, line_no: int, line: str) -> list[Finding]:
+        """Scan a single line and return all deterministic findings."""
+        watch_tokens = self._watch_tokens_strict if self.config.strict else self._watch_tokens_normal
+        hints = _ScanHints(
+            check_secrets=True,
+            check_pan=True,
+            check_secret_assign=True,
+            check_home_path=True,
+            check_ts_net=True,
+            tailnet_domains=self._tailnet_domain_entries,
+            check_ipv4=True,
+            check_ts_ipv6=True,
+            check_url_port=True,
+            watch_tokens=watch_tokens,
+            watch_token_tuple=None,
+            identity_fallback=self._identity_fallback,
+            strict_host_fallback=self._strict_host_fallback,
+            context_host_fallback=self._context_host_fallback,
+            strict_only_fallback=self._strict_only_fallback,
+            extra_term_fallback=self._extra_term_fallback,
+            check_ui=is_ui_source_path(rel_path),
+            known_can_anchor=False,
+        )
+        return self._scan_line_core(rel_path, line_no, line, hints)
 
     def scan_text(self, rel_path: str, text: str) -> list[Finding]:
-        """Scan multi-line text content line by line."""
-        findings: list[Finding] = []
+        """Scan multi-line text content line by line with sound file-level prefiltering."""
+        if not text:
+            return []
+
+        is_ascii = text.isascii()
+        if not is_ascii and _has_unicode_ascii_fold(text):
+            findings: list[Finding] = []
+            for idx, line in enumerate(text.splitlines(), start=1):
+                findings.extend(self.scan_line(rel_path, idx, line))
+            return findings
+
+        text_lower = text.lower()
+        check_secrets = (
+            "PRIVATE KEY-----" in text
+            or "AKIA" in text
+            or "ASIA" in text
+            or (
+                "_" in text
+                and (
+                    "ghp_" in text
+                    or "gho_" in text
+                    or "ghu_" in text
+                    or "ghs_" in text
+                    or "ghr_" in text
+                    or "github_pat_" in text
+                )
+            )
+            or "k_live_" in text
+            or "k_test_" in text
+            or "sk-" in text
+            or "xox" in text
+            or "eyJ" in text
+        )
+        check_pan = len(text) >= 15 and (_RE_PAN_PREFILTER.search(text) is not None)
+        check_secret_assign = ("=" in text or ":" in text) and (
+            "key" in text_lower
+            or "secret" in text_lower
+            or "token" in text_lower
+            or "passw" in text_lower
+        )
+        check_home_path = (
+            "/home/" in text
+            or "Users" in text
+            or any(hp in text for hp in self._home_paths)
+        )
+        check_ts_net = ".ts.net" in text_lower
+        tailnet_domains = tuple(
+            entry
+            for entry in self._tailnet_domain_entries
+            if (not entry[1]) or (entry[0] in text_lower)
+        )
+        check_ipv4 = "." in text and (
+            "10." in text or "172." in text or "192.168." in text or "100." in text
+        )
+        check_ts_ipv6 = "fd7a:115c:a1e0:" in text_lower
+        check_url_port = "://" in text
+
+        watch_bytes = self._watch_bytes_strict if self.config.strict else self._watch_bytes_normal
+        if watch_bytes:
+            # Non-ASCII chars are replaced with b'?' (outside [A-Za-z0-9_-]) and split identically to ASCII tokens.
+            raw_bytes = text.encode("ascii", "replace")
+            matched_bytes = watch_bytes.intersection(raw_bytes.translate(_BYTES_HOST_TOKEN_TRANS).split())
+            file_watch_tokens = frozenset(b.decode("ascii") for b in matched_bytes)
+        else:
+            file_watch_tokens = frozenset()
+        watch_token_tuple = tuple(file_watch_tokens) if 0 < len(file_watch_tokens) <= 8 else None
+
+        identity_fallback = tuple(
+            r for r in self._identity_fallback if _fallback_matches_text(r, text_lower)
+        )
+        strict_host_fallback = tuple(
+            r for r in self._strict_host_fallback if _fallback_matches_text(r, text_lower)
+        )
+        context_host_fallback = tuple(
+            e for e in self._context_host_fallback if (not e.is_ascii) or (e.host_lower in text_lower)
+        )
+        strict_only_fallback = (
+            tuple(r for r in self._strict_only_fallback if _fallback_matches_text(r, text_lower))
+            if self.config.strict
+            else ()
+        )
+        extra_term_fallback = tuple(
+            r for r in self._extra_term_fallback if _fallback_matches_text(r, text_lower)
+        )
+        check_ui = is_ui_source_path(rel_path) and (
+            (not is_ascii)
+            or "&#" in text
+            or "\\u" in text
+            or ("\\" in text and _is_css_path(rel_path))
+        )
+
+        if not (
+            check_secrets
+            or check_pan
+            or check_secret_assign
+            or check_home_path
+            or check_ts_net
+            or tailnet_domains
+            or check_ipv4
+            or check_ts_ipv6
+            or check_url_port
+            or file_watch_tokens
+            or identity_fallback
+            or strict_host_fallback
+            or context_host_fallback
+            or strict_only_fallback
+            or extra_term_fallback
+            or check_ui
+        ):
+            return []
+
+        hints = _ScanHints(
+            check_secrets=check_secrets,
+            check_pan=check_pan,
+            check_secret_assign=check_secret_assign,
+            check_home_path=check_home_path,
+            check_ts_net=check_ts_net,
+            tailnet_domains=tailnet_domains,
+            check_ipv4=check_ipv4,
+            check_ts_ipv6=check_ts_ipv6,
+            check_url_port=check_url_port,
+            watch_tokens=file_watch_tokens,
+            watch_token_tuple=watch_token_tuple,
+            identity_fallback=identity_fallback,
+            strict_host_fallback=strict_host_fallback,
+            context_host_fallback=context_host_fallback,
+            strict_only_fallback=strict_only_fallback,
+            extra_term_fallback=extra_term_fallback,
+            check_ui=check_ui,
+            known_can_anchor=True,
+        )
+
+        findings = []
+        scan_core = self._scan_line_core
         for idx, line in enumerate(text.splitlines(), start=1):
-            findings.extend(self.scan_line(rel_path, idx, line))
+            line_hits = scan_core(rel_path, idx, line, hints)
+            if line_hits:
+                findings.extend(line_hits)
         return findings
 
     def scan_file(self, root: Path, rel_path: str) -> list[Finding]:
@@ -952,7 +1642,7 @@ class RepoScanner:
         findings: list[Finding] = []
         current_path = ""
         current_line = 0
-        hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+        hunk_re = _RE_UNIFIED_DIFF_HUNK
 
         for raw_line in diff_text.splitlines():
             if raw_line.startswith("+++ "):
